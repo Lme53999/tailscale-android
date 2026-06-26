@@ -8,8 +8,11 @@ import android.os.ParcelFileDescriptor
 import android.provider.DocumentsContract
 import androidx.documentfile.provider.DocumentFile
 import com.tailscale.ipn.TaildropDirectoryStore
+import com.tailscale.ipn.ui.notifier.Notifier
+import com.tailscale.ipn.ui.notifier.TaildropNotifier
 import com.tailscale.ipn.ui.util.InputStreamAdapter
 import com.tailscale.ipn.ui.util.OutputStreamAdapter
+import java.io.File
 import java.io.FileOutputStream
 import java.io.IOException
 import java.io.OutputStream
@@ -120,8 +123,26 @@ object ShareFileHelper : libtailscale.ShareFileHelper {
 
   private val currentUri = ConcurrentHashMap<String, String>()
 
+  private val inlineShareCacheFiles = ConcurrentHashMap<String, File>()
+
+  private fun inlineShareCacheRoot(ctx: Context): File {
+    val dir = File(ctx.cacheDir, "inline-share-in")
+    if (!dir.exists()) dir.mkdirs()
+    return dir
+  }
+
   @Throws(IOException::class)
   override fun openFileWriter(fileName: String, offset: Long): libtailscale.OutputStream {
+    if (InlineShare.matchesAnyStage(fileName)) {
+      val ctx = appContext ?: throw IOException("App context not initialized")
+      val cached =
+          inlineShareCacheFiles.computeIfAbsent(fileName) {
+            File(inlineShareCacheRoot(ctx), fileName)
+          }
+      val fos = FileOutputStream(cached, offset != 0L)
+      if (offset == 0L) fos.channel.truncate(0)
+      return OutputStreamAdapter(fos)
+    }
     runBlocking { waitUntilTaildropDirReady() }
     val (uri, stream) = openWriterFD(fileName, offset)
     currentUri[fileName] = uri
@@ -130,6 +151,15 @@ object ShareFileHelper : libtailscale.ShareFileHelper {
 
   @Throws(IOException::class)
   override fun getFileURI(fileName: String): String {
+    if (InlineShare.matchesAnyStage(fileName)) {
+      val ctx = appContext ?: throw IOException("App context not initialized")
+      val cached =
+          inlineShareCacheFiles[fileName]
+              ?: File(inlineShareCacheRoot(ctx), fileName).also {
+                inlineShareCacheFiles[fileName] = it
+              }
+      return Uri.fromFile(cached).toString()
+    }
     runBlocking { waitUntilTaildropDirReady() }
     currentUri[fileName]?.let {
       return it
@@ -147,6 +177,9 @@ object ShareFileHelper : libtailscale.ShareFileHelper {
 
   @Throws(IOException::class)
   override fun renameFile(oldPath: String, targetName: String): String {
+    if (InlineShare.matches(targetName)) {
+      return consumeInlineShare(oldPath, targetName)
+    }
     val ctx = appContext ?: throw IOException("not initialized")
     val dirUri = savedUri ?: throw IOException("directory not set")
     val srcUri = Uri.parse(oldPath)
@@ -207,14 +240,83 @@ object ShareFileHelper : libtailscale.ShareFileHelper {
 
   @Throws(IOException::class)
   override fun deleteFile(uri: String) {
+    val parsed = Uri.parse(uri)
+    // Cache-dir plain files; SAF can't resolve them.
+    if (parsed.scheme == "file" ||
+        parsed.lastPathSegment?.let { InlineShare.matchesAnyStage(it) } == true) {
+      parsed.path?.let { File(it).delete() }
+      return
+    }
     runBlocking { waitUntilTaildropDirReady() }
     val ctx = appContext ?: throw IOException("DeleteFile: not initialized")
-    val parsedUri = Uri.parse(uri)
     val doc =
-        DocumentFile.fromSingleUri(ctx, parsedUri)
-            ?: throw IOException("DeleteFile: cannot resolve URI $parsedUri")
+        DocumentFile.fromSingleUri(ctx, parsed)
+            ?: throw IOException("DeleteFile: cannot resolve URI $parsed")
     if (!doc.delete()) {
-      throw IOException("DeleteFile: delete() returned false for $parsedUri")
+      throw IOException("DeleteFile: delete() returned false for $parsed")
+    }
+  }
+
+  private fun consumeInlineShare(oldPath: String, targetName: String): String {
+    val ctx = appContext ?: throw IOException("inline share: not initialized")
+    val root = inlineShareCacheRoot(ctx)
+    val parsedOld = runCatching { Uri.parse(oldPath) }.getOrNull()
+    val partialFromUri = parsedOld?.lastPathSegment?.takeIf { it.isNotEmpty() }
+
+    val partialName =
+        partialFromUri
+            ?: root
+                .listFiles { _, n -> n.startsWith("$targetName.") && n.endsWith(".partial") }
+                ?.firstOrNull()
+                ?.name
+            ?: "$targetName.partial"
+    val cachedPartial = inlineShareCacheFiles[partialName] ?: File(root, partialName)
+    var bytes: ByteArray =
+        if (cachedPartial.exists()) {
+          runCatching { cachedPartial.readBytes() }
+              .onFailure {
+                TSLog.w("ShareFileHelper", "consumeInlineShare: cache read failed: $it")
+              }
+              .getOrDefault(ByteArray(0))
+        } else ByteArray(0)
+
+    // Fallback if openFileWriter missed and the partial landed in SAF instead.
+    if (bytes.isEmpty() && parsedOld != null && parsedOld.scheme == "content") {
+      bytes =
+          runCatching { ctx.contentResolver.openInputStream(parsedOld)?.use { it.readBytes() } }
+              .onFailure { TSLog.w("ShareFileHelper", "consumeInlineShare: SAF read failed: $it") }
+              .getOrNull() ?: ByteArray(0)
+      runCatching { ctx.contentResolver.delete(parsedOld, null, null) }
+    }
+
+    if (bytes.isNotEmpty()) {
+      val share = InlineShare.decode(targetName, bytes)
+      if (share != null) {
+        val pending = PendingInlineShare(kind = share.kind, content = share.content)
+        Notifier.appendInlineShare(pending)
+        TaildropNotifier.notify(ctx, pending)
+      } else {
+        TSLog.w("ShareFileHelper", "consumeInlineShare: decode failed for $targetName")
+      }
+    } else {
+      TSLog.w("ShareFileHelper", "consumeInlineShare: no bytes for $targetName")
+    }
+
+    cachedPartial.delete()
+    inlineShareCacheFiles.remove(partialName)
+    sweepSafInlineShareArtifacts(ctx)
+
+    return Uri.fromFile(File(root, targetName)).toString()
+  }
+
+  private fun sweepSafInlineShareArtifacts(ctx: Context) {
+    val dirUri = savedUri ?: return
+    val dir = runCatching { DocumentFile.fromTreeUri(ctx, Uri.parse(dirUri)) }.getOrNull() ?: return
+    for (child in runCatching { dir.listFiles() }.getOrNull().orEmpty()) {
+      val n = child.name ?: continue
+      if (InlineShare.matchesAnyStage(n)) {
+        runCatching { child.delete() }
+      }
     }
   }
 

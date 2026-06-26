@@ -14,11 +14,13 @@ import com.tailscale.ipn.ui.model.Netmap
 import com.tailscale.ipn.ui.model.NodeID
 import com.tailscale.ipn.ui.model.Tailcfg
 import com.tailscale.ipn.ui.util.set
+import com.tailscale.ipn.util.PendingInlineShare
 import com.tailscale.ipn.util.TSLog
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
 import kotlinx.serialization.ExperimentalSerializationApi
 import kotlinx.serialization.json.Json
@@ -56,6 +58,17 @@ object Notifier {
   val outgoingFiles: StateFlow<List<Ipn.OutgoingFile>?> = MutableStateFlow(null)
   val incomingFiles: StateFlow<List<Ipn.PartialFile>?> = MutableStateFlow(null)
   val filesWaiting: StateFlow<Empty.Message?> = MutableStateFlow(null)
+
+  private val _inlineShareInbox = MutableStateFlow<List<PendingInlineShare>>(emptyList())
+  val inlineShareInbox: StateFlow<List<PendingInlineShare>> = _inlineShareInbox
+
+  fun appendInlineShare(p: PendingInlineShare) {
+    _inlineShareInbox.update { it + p }
+  }
+
+  fun removeInlineShare(id: String) {
+    _inlineShareInbox.update { list -> list.filterNot { it.id == id } }
+  }
 
   private val userProfiles = mutableMapOf<String, Tailcfg.UserProfile>()
 
