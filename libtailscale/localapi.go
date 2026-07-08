@@ -132,8 +132,10 @@ func (app *App) EditPrefs(prefs ipn.MaskedPrefs) (LocalAPIResponse, error) {
 func (app *App) callLocalAPI(timeoutMillis int, method, endpoint string, header http.Header, body io.ReadCloser) (LocalAPIResponse, error) {
 	defer func() {
 		if p := recover(); p != nil {
-			log.Printf("panic in callLocalAPI %s: %s", p, debug.Stack())
-			panic(p)
+			log.Printf("panic in callLocalAPI %s: %s (NOT rethrowing — embedded app stays alive)", p, debug.Stack())
+			// Don't rethrow: on Android the JNI boundary converts Go panics
+			// into uncaught java.lang.Errors that the runtime kills the
+			// process for. Swallow it here so embedded callers stay up.
 		}
 	}()
 
