@@ -1,0 +1,37 @@
+name: Build libtailscale.aar
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build-aar:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Check out code
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Set up Go (from go.mod)
+        uses: actions/setup-go@0aaccfd150d50ccaeb58ebd88d36e91967a5f35b # v5.4.0
+        with:
+          go-version-file: "go.mod"
+
+      - name: Switch to Java 17
+        uses: actions/setup-java@3a4f6e1af504cf6a31855fa899c6aa5355ba6c12 # v4.7.0
+        with:
+          distribution: "temurin"
+          java-version: "17"
+
+      - name: Run androidsdk target (installs NDK + SDK)
+        run: make androidsdk
+
+      - name: Build libtailscale.aar
+        run: make libtailscale
+
+      - name: Upload AAR as artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: libtailscale-aar
+          path: android/libs/libtailscale.aar
+          if-no-files-found: error
+          retention-days: 7
